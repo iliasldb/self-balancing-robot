@@ -1,6 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.integrate import solve_ivp
+from scipy.linalg import solve_continuous_are
 
 g = 9.81  # Acceleration due to gravity (m/s^2)
 l = 0.5 # Length of the pendulum (m)
@@ -29,8 +30,8 @@ y0 = [theta_0, theta_dot_0, x_0, x_dot_0]
 
 # Time span
 t_start = 0.0
-t_end   = 3.0
-t_eval  = np.linspace(t_start, t_end, 1000)
+t_end   = 2.0
+t_eval  = np.linspace(t_start, t_end, 300)
 
 # Simulate with zero force (no controller)
 F = 0.0
@@ -39,7 +40,9 @@ sol_open = solve_ivp(
     t_span=(t_start, t_end),
     y0=y0,
     t_eval=t_eval,
-    method='RK45'
+    method='RK45',
+    events=lambda t, y: abs(y[0]) - np.pi/2,  # stop at 90 degrees
+    dense_output=True
 )
 
 def simulate_pid(kp, ki, kd, y0, t_end=5.0, dt=0.01):
@@ -84,32 +87,120 @@ def simulate_pid(kp, ki, kd, y0, t_end=5.0, dt=0.01):
 
     return np.array(t_vals), np.array(y_vals)
 
-# Run uncontrolled
-t_open = sol_open.t
-theta_open = sol_open.y[0] * 180 / np.pi   # convert to degrees
+def linearize_system():
+    """
+    Linearize the pendulum equations around the upright equilibrium.
+    Returns A and B matrices of the linear system: x_dot = Ax + Bu
+    """
+    # A matrix — how the state evolves naturally (no control)
+    A = np.array([
+        [0,                    1,  0, 0],
+        [(M + m) * g / (M * l), 0, 0, 0],
+        [0,                    0,  0, 1],
+        [-m * g / M,           0,  0, 0]
+    ])
 
-# Run with PID — tune these gains
-t_pid, y_pid = simulate_pid(kp=50, ki=2, kd=8, y0=y0, t_end=5.0)
-theta_pid = y_pid[:, 0] * 180 / np.pi
+    # B matrix — how control input (force) affects the state
+    B = np.array([
+        [0],
+        [-1 / (M * l)],
+        [0],
+        [1 / M]
+    ])
 
-# Plot
-fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 7))
+    return A, B
 
-ax1.plot(t_open, theta_open, color='#A32D2D', linewidth=2)
-ax1.axhline(0, color='gray', linestyle='--', linewidth=0.8)
-ax1.set_title('No controller — pendulum falls freely')
-ax1.set_ylabel('Angle (degrees)')
-ax1.set_xlabel('Time (s)')
-ax1.grid(True, alpha=0.3)
 
-ax2.plot(t_pid, theta_pid, color='#185FA5', linewidth=2)
-ax2.axhline(0, color='gray', linestyle='--', linewidth=0.8)
-ax2.set_title('PID controller — pendulum stabilizes')
-ax2.set_ylabel('Angle (degrees)')
-ax2.set_xlabel('Time (s)')
-ax2.grid(True, alpha=0.3)
+def compute_lqr_gain(Q, R):
+    """
+    Solve the continuous-time Algebraic Riccati Equation (CARE)
+    to find the optimal LQR gain matrix K.
+    """
+    A, B = linearize_system()
+
+    # Solve CARE: A^T P + P A - P B R^-1 B^T P + Q = 0
+    P = solve_continuous_are(A, B, Q, R)
+
+    # Compute gain: K = R^-1 B^T P
+    K = np.linalg.inv(R) @ B.T @ P
+
+    return K
+
+
+def simulate_lqr(K, y0, t_end=5.0, dt=0.01):
+    """Simulate the pendulum with an LQR controller."""
+    t_vals    = [0.0]
+    y_vals    = [list(y0)]
+    y_current = list(y0)
+    t         = 0.0
+
+    while t < t_end:
+        # State vector
+        x = np.array(y_current)
+
+        # LQR control law: F = -K @ x
+        F = float((-K @ x).item())
+
+        # Clamp force
+        F = np.clip(F, -20, 20)
+
+        # Step forward
+        sol = solve_ivp(
+            fun=lambda t, y: pendulum(t, y, F),
+            t_span=(t, t + dt),
+            y0=y_current,
+            method='RK45'
+        )
+        y_current = [sol.y[i][-1] for i in range(4)]
+        t        += dt
+
+        t_vals.append(t)
+        y_vals.append(list(y_current))
+
+        if abs(y_current[0]) > np.pi / 2:
+            print(f"LQR: fell at t={t:.2f}s")
+            break
+
+    return np.array(t_vals), np.array(y_vals)
+
+# 1. No control
+t_open    = sol_open.t
+theta_open = sol_open.y[0] * 180 / np.pi
+
+# 2. PID
+t_pid, y_pid   = simulate_pid(kp=50, ki=2, kd=8, y0=y0, t_end=5.0)
+theta_pid      = y_pid[:, 0] * 180 / np.pi
+
+# 3. LQR — tune Q and R here
+Q = np.diag([10, 1, 1, 1])   # penalize angle most
+R = np.array([[1]])           # control effort weight
+K = compute_lqr_gain(Q, R)
+print(f"LQR gain K = {K}")
+
+t_lqr, y_lqr = simulate_lqr(K, y0, t_end=5.0)
+theta_lqr     = y_lqr[:, 0] * 180 / np.pi
+
+# ─── Plot ────────────────────────────────────────────────────────────────────
+
+fig, axes = plt.subplots(3, 1, figsize=(10, 10))
+
+configs = [
+    (axes[0], t_open, theta_open, '#A32D2D', 'No controller — pendulum falls freely'),
+    (axes[1], t_pid,  theta_pid,  '#185FA5', 'PID controller (Kp=50, Ki=2, Kd=8)'),
+    (axes[2], t_lqr,  theta_lqr,  '#3B6D11', 'LQR controller (optimal gains)'),
+]
+
+
+for ax, t, theta, color, title in configs:
+    ax.plot(t, theta, color=color, linewidth=2)
+    ax.axhline(0, color='gray', linestyle='--', linewidth=0.8)
+    ax.set_title(title)
+    ax.set_ylabel('Angle (degrees)')
+    ax.set_xlabel('Time (s)')
+    ax.set_ylim(-90, 90)
+    ax.grid(True, alpha=0.3)
 
 plt.tight_layout()
 plt.savefig('simulation_result.png', dpi=150)
 plt.show()
-print("Plot saved as simulation_result.png")
+print("Plot saved.")
