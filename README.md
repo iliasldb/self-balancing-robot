@@ -21,7 +21,7 @@ implementing and comparing PID and LQR control strategies.
 The simulation models the full nonlinear dynamics of a cart-pendulum system
 and compares three scenarios: no control, PID, and LQR.
 
-![Simulation result](simulation_result.png)
+![Simulation result](simulation/simulation_result.png)
 
 ### What the plots show
 - **No controller** — starting from 10°, the pendulum falls to 90° in under 1 second
