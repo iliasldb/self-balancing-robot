@@ -168,7 +168,7 @@ t_open    = sol_open.t
 theta_open = sol_open.y[0] * 180 / np.pi
 
 # 2. PID
-t_pid, y_pid   = simulate_pid(kp=50, ki=2, kd=8, y0=y0, t_end=5.0)
+t_pid, y_pid   = simulate_pid(kp=50, ki=2, kd=8, y0=y0, t_end=3.0)
 theta_pid      = y_pid[:, 0] * 180 / np.pi
 
 # 3. LQR — tune Q and R here
@@ -177,12 +177,12 @@ R = np.array([[1]])           # control effort weight
 K = compute_lqr_gain(Q, R)
 print(f"LQR gain K = {K}")
 
-t_lqr, y_lqr = simulate_lqr(K, y0, t_end=5.0)
+t_lqr, y_lqr = simulate_lqr(K, y0, t_end=3.0)
 theta_lqr     = y_lqr[:, 0] * 180 / np.pi
 
 # ─── Plot ────────────────────────────────────────────────────────────────────
 
-fig, axes = plt.subplots(3, 1, figsize=(10, 10))
+fig, axes = plt.subplots(3, 1, figsize=(10, 12))
 
 configs = [
     (axes[0], t_open, theta_open, '#A32D2D', 'No controller — pendulum falls freely'),
@@ -197,8 +197,8 @@ for ax, t, theta, color, title in configs:
     ax.set_title(title)
     ax.set_ylabel('Angle (degrees)')
     ax.set_xlabel('Time (s)')
-    ax.set_ylim(-90, 90)
-    ax.grid(True, alpha=0.3)
+    ax.set_ylim(-30, 90)
+    ax.grid(True)
 
 plt.tight_layout()
 plt.savefig('simulation_result.png', dpi=150)
