@@ -10,7 +10,7 @@ implementing and comparing PID and LQR control strategies.
 | Stage | Description | Status |
 |-------|-------------|--------|
 | 1 | Physics simulation — PID and LQR comparison in Python | ✅ Complete |
-| 2 | IMU sensor integration — MPU-6050 angle estimation on Metro M0 | 🔜 Next |
+| 2 | IMU sensor integration — MPU-6050 angle estimation on Metro M0 | ✅ Complete |
 | 3 | Closed-loop control — PID running on real hardware | ⬜ Planned |
 | 4 | LQR on hardware + tuning | ⬜ Planned |
 
