@@ -4,69 +4,208 @@
 #include <Wire.h>
 #include <math.h>
 
+//Pin definitions
+#define PWMA 5 //Motor A speed control
+#define AIN1 3 //Motor A direction control
+#define AIN2 4 //Motor A direction control
+#define PWMB 10 //Motor B speed control
+#define BIN1 8 //Motor B direction control
+#define BIN2 9 //Motor B direction control
+#define STBY 6 //TB6612FNG standby pin
+
+//PID control parameters
+float Kp = 20.0; //Proportional gain
+float Ki = 0.5; //Integral gain
+float Kd = 1.5; //Derivative gain
+
+//Setpoint for balancing (target angle)
+float setpoint = 0.0; //Target angle (upright position)
+
+//Complementary filter parameters
+const float alpha = 0.98; //Filter coefficient
+float angle = 0.0; //Estimated angle
+float gyro_biais = 0.0; //Gyro bias
+
+//PID state variables
+float integral = 0.0; //Integral term
+float previous_error = 0.0; //Previous error for derivative term
+
+//Timing
+unsigned long previous_time = 0; //Previous time for PID calculation
+const float DT = 0.01; //Time step (10 ms)
+
+//Safety limits
+const float FALL_ANGLE = 30.0; //Angle at which the robot is considered to have fallen
+
 Adafruit_MPU6050 mpu;
 
-const float ALPHA = 0.98;
+/*
+    MOTOR CONTROL FUNCTIONS
+*/
 
-float angle     = 0.0;
-unsigned long last_time = 0;
+void motors_init() {
+  pinMode(PWMA, OUTPUT);
+  pinMode(AIN1, OUTPUT);
+  pinMode(AIN2, OUTPUT);
+  pinMode(PWMB, OUTPUT);
+  pinMode(BIN1, OUTPUT);
+  pinMode(BIN2, OUTPUT);
+  pinMode(STBY, OUTPUT);
+  digitalWrite(STBY, HIGH); //Take the motor driver out of standby mode
+}
 
-void setup() {
+void motors_stop(){
+    analogWrite(PWMA, 0);
+    analogWrite(PWMB, 0);
+    digitalWrite(AIN1, LOW);
+    digitalWrite(AIN2, LOW);
+    digitalWrite(BIN1, LOW);
+    digitalWrite(BIN2, LOW);
+}
+
+void motors_drive(float output){
+    //Output is a value between -255 and 255
+    //positive output drives forward, negative output drives backward
+    int speed = (int)constrain(abs(output), 0, 255);
+    bool forward = output > 0;
+
+    //Motor A control
+    digitalWrite(AIN1, forward ? HIGH : LOW);
+    digitalWrite(AIN2, forward ? LOW : HIGH);
+    analogWrite(PWMA, speed);
+
+    //Motor B control   
+    digitalWrite(BIN1, forward ? HIGH : LOW);
+    digitalWrite(BIN2, forward ? LOW : HIGH);
+    analogWrite(PWMB, speed);
+}
+
+/*
+    IMU INITIALIZATION AND DATA PROCESSING FUNCTIONS
+*/
+
+void calibrate_gyro(){
+    Serial.println("Calibrating gyro... Keep the robot still.");
+    float biais = 0.0;
+    for (int i = 0; i < 500; i++) {
+        sensors_event_t a, g, temp;
+        mpu.getEvent(&a, &g, &temp);
+        biais += g.gyro.y; //Assuming the robot is perfectly still, the gyro reading should be zero. Any average offset is considered bias.
+        delay(4);
+    }
+    gyro_biais = biais / 500.0;
+    Serial.print("Gyro bias: ");
+    Serial.println(gyro_biais, 5);
+}
+
+float read_angle(float dt){
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
+
+    //Calculate angle from accelerometer (in degrees)
+    float acc_angle = atan2(a.acceleration.x, -a.acceleration.z) * 180.0 / PI;
+
+    //Calculate angle from gyro (in degrees)
+    float gyro_rate = g.gyro.y - gyro_biais; //Remove bias
+    float gyro_angle = angle + gyro_rate * dt *180.0 / PI; //Integrate gyro rate to get angle
+
+    //Complementary filter to combine accelerometer and gyro data
+    angle = alpha * gyro_angle + (1 - alpha) * acc_angle;
+
+    return angle;
+}
+
+/*
+    PID CONTROL FUNCTION
+*/
+
+float compute_pid(float current_angle, float dt){
+    float error = current_angle - setpoint; //Calculate error
+
+    //Integral term calculation with anti-windup
+    integral += error * dt; //Update integral term
+    integral = constraint(integral, -50, 50);
+
+    //derivative term calculation
+    float derivative = (error - previous_error) / dt; //Calculate derivative term
+    previous_error = error; //Update previous error
+
+    return Kp * error + Ki * integral + Kd * derivative; //Calculate PID output
+}
+
+/*
+    SETUP AND MAIN LOOP
+*/
+
+void setup()
+{
     Serial.begin(115200);
-    while (!Serial) delay(10);
+    while (!Serial) delay(10); //Wait for serial connection
 
+    //Initialize IMU
     if (!mpu.begin()) {
-        Serial.println("MPU6050 not found!");
-        while (1) delay(10);
+        Serial.println("Failed to find MPU6050 chip");
+        while (1) {
+            delay(10);
+        }
     }
 
     mpu.setAccelerometerRange(MPU6050_RANGE_2_G);
     mpu.setGyroRange(MPU6050_RANGE_250_DEG);
     mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
 
-    // Calibration — average gyro bias over 200 samples at startup
-    Serial.println("Calibrating gyro — hold the board still...");
-    float gyro_bias = 0.0;
-    for (int i = 0; i < 200; i++) {
-        sensors_event_t a, g, temp;
-        mpu.getEvent(&a, &g, &temp);
-        gyro_bias += g.gyro.y;   // AX tilt = GY rotation
-        delay(5);
-    }
-    gyro_bias /= 200.0;
-    Serial.print("Gyro bias: ");
-    Serial.println(gyro_bias, 5);
+    //Initialize motors
+    motors_init();
+    motors_stop();
 
-    // Store bias in a global so loop() can use it
-    // (we'll handle this with a simple global below)
+    //Calibrate gyro
+    calibrate_gyro();
+
+    Serial.println("Setup complete. Starting main loop.");
+    delay(2000);
+
     last_time = micros();
 }
 
-// Gyro bias measured at startup
-float gyro_bias = 0.0;
-
-void loop() {
+void loop(){
+    //Enforce a consistent loop timing
     unsigned long now = micros();
-    float dt = (now - last_time) / 1e6;
-    last_time = now;
+    if ((now - previous_time) < (DT * 1e6)) return; //Wait until the next time step
+    float dt = (now - previous_time) / 1e6; //Calculate actual time step in seconds
+    previous_time = now; //Update previous time
 
-    sensors_event_t a, g, temp;
-    mpu.getEvent(&a, &g, &temp);
+    //read current angle from IMU
+    angle = read_angle(dt);
 
-    // Correct axis: AX/AZ for forward tilt, GY for rotation rate
-    float accel_angle = atan2(a.acceleration.x, -a.acceleration.z) * 180.0 / PI;
-    float gyro_rate   = g.gyro.y - gyro_bias;
-    float gyro_angle  = angle + gyro_rate * dt * 180.0 / PI;
+    //safety check: if the robot has fallen, stop the motors and reset PID state
+    if (abs(angle) > FALL_ANGLE) {
+        Serial.println("Robot has fallen! Stopping motors.");
+        motors_stop();
+        integral = 0.0; //Reset integral term
+        previous_error = 0.0; //Reset previous error
+        return; //Skip the rest of the loop
+    }
 
-    // Complementary filter
-    angle = ALPHA * gyro_angle + (1 - ALPHA) * accel_angle;
+    //Compute PID output
+    float output = compute_pid(angle, dt);
 
-    Serial.print("Angle: ");
-    Serial.print(angle, 2);
-    Serial.print(" deg  |  Accel: ");
-    Serial.print(accel_angle, 2);
-    Serial.print(" deg  |  Gyro rate: ");
-    Serial.println(gyro_rate, 4);
+    check_serial_commands();
+    //Drive motors based on PID output
+    motors_drive(output);
 
-    delay(10);
+    Serial.print("Angle: "); Serial.print(angle, 2);
+    Serial.print(" | PID: "); Serial.println(output, 2);
+    Serial.print(" | Err: "); Serial.print(angle - setpoint, 2);
+}
+
+void check_serial_commands(){
+    if (Serial.available() > 0) {
+       char cmd = Serial.read();
+        float val = Serial.parseFloat();
+        switch (cmd) {
+            case 'P': KP = val; Serial.print("KP="); Serial.println(KP); break;
+            case 'I': KI = val; Serial.print("KI="); Serial.println(KI); break;
+            case 'D': KD = val; Serial.print("KD="); Serial.println(KD); break;
+            case 'S': SETPOINT = val; Serial.print("SP="); Serial.println(SETPOINT); break;
+    }
 }
