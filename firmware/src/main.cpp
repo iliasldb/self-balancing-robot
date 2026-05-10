@@ -1,3 +1,28 @@
+/*
+ * Self-Balancing Robot — Stage 3: PID Control on Hardware
+ * ========================================================
+ * Implements a closed-loop PID controller on the Adafruit Metro M0 Express.
+ * 
+ * Hardware:
+ *   - Adafruit Metro M0 Express (SAMD21, 48MHz)
+ *   - MPU-6050 IMU (I2C) — angle estimation via complementary filter
+ *   - TB6612FNG dual motor driver
+ *   - 2x TT DC gear motors (6V, 200RPM)
+ *   - 4x AA batteries (6V)
+ * 
+ * Control loop (100Hz):
+ *   1. Read IMU → compute angle via complementary filter
+ *   2. Compute PID output from angle error
+ *   3. Drive motors proportional to PID output
+ *   4. Cut motors if angle exceeds safety threshold
+ * 
+ * Live tuning via serial monitor:
+ *   Send P20.5 to set KP, I0.3 for KI, D1.8 for KD, S2.0 for setpoint
+ * 
+ * Author : Ilias
+ * Date   : May 2026
+ */
+
 #include <Arduino.h>
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
