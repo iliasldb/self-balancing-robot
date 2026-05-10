@@ -4,9 +4,6 @@ A two-wheeled self-balancing robot built on an Adafruit Metro M0 Express,
 implementing and comparing PID and LQR control strategies — from mathematical
 simulation to working hardware.
 
-Developed during the summer before starting a Master's in Robotics at UC San Diego,
-as a hands-on introduction to control theory, embedded C++, and sensor fusion.
-
 ---
 
 ## Project overview
