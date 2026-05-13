@@ -189,7 +189,7 @@ def simulate_lqr_kalman(Q, R, y0, t_end=5.0, dt=0.01):
     (no encoder in this simulation).
     """
     K            = compute_lqr_gain(Q, R)
-    print(f"K = {K}")
+    #print(f"K = {K}")
     A_kf, _, _, H = make_kalman(dt)
 
     # LQR-specific Kalman tuning — smoother than PID version
@@ -215,11 +215,12 @@ def simulate_lqr_kalman(Q, R, y0, t_end=5.0, dt=0.01):
         F_raw  = float(np.clip(K @ state, -50, 50))
         F      = F_raw
         F_prev = F
-        
-        if t < 0.06:
-            print(f"t={t:.3f} | theta_est={x_hat[0]*180/np.pi:.2f}° "
-                f"| F_raw={F_raw:.2f} | F={F:.2f} "
-                f"| true_theta={y_cur[0]*180/np.pi:.2f}°")
+
+        #Debug print for first few steps to see estimates vs true values
+        #if t < 0.06:
+        #    print(f"t={t:.3f} | theta_est={x_hat[0]*180/np.pi:.2f}° "
+        #        f"| F_raw={F_raw:.2f} | F={F:.2f} "
+        #        f"| true_theta={y_cur[0]*180/np.pi:.2f}°")
 
         sol   = solve_ivp(lambda t, y: pendulum(t, y, F),
                           (t, t + dt), y_cur, method='RK45')

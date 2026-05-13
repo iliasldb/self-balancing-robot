@@ -26,29 +26,49 @@ The project follows four stages — simulation first, hardware second:
 ## Stage 1 — Simulation
 
 Models the full nonlinear dynamics of a cart-pendulum system using Lagrangian
-mechanics, then compares three scenarios.
+mechanics, then compares control strategies under realistic sensor noise.
 
 ![Simulation results](simulation/simulation_result.png)
 
-### Controllers compared
+### Sensor noise model
 
-**No control** — starting from 10°, the pendulum falls to 90° in under one second.
-Demonstrates why active control is necessary.
+All controlled simulations include realistic MPU-6050 sensor noise:
+- Accelerometer noise: σ = 0.05 rad
+- Gyroscope noise: σ = 0.01 rad/s
+- Gyroscope bias: 0.02 rad/s (constant drift)
 
-**PID controller** — manually tuned gains (Kp=50, Ki=2, Kd=8) stabilize the angle
-with moderate oscillation. No knowledge of system physics required — gains are found
-by feel and iteration.
+### Controllers and filters compared
 
-**LQR controller** — optimal gains computed automatically via the continuous-time
-algebraic Riccati equation. Given a cost matrix expressing priorities (Q penalizes
-state error, R penalizes control effort), the math finds the best possible gains.
-Result: faster settling and less overshoot than PID.
+**No control** — pendulum falls to 90° in under one second from a 10° initial tilt.
 
-### Key insight
+**PID — no filter** — raw noisy accelerometer angle fed directly to PID.
+Noisiest response, most oscillation, falls under sustained disturbance.
 
-PID requires manual tuning. LQR requires an accurate system model but computes
-optimal gains automatically. In simulation LQR wins clearly — the hardware stages
-will test how well this holds with real-world noise and modeling error.
+**PID — complementary filter** — gyroscope and accelerometer blended with
+α=0.98. Smoother response than raw sensor, less overshoot than Kalman+PID.
+
+**PID — Kalman filter** — optimal state estimation, but introduces phase lag
+that slightly degrades PID derivative term performance.
+
+**LQR — Kalman filter** — optimal control with optimal estimation. Fastest
+settling time, least overshoot once gains and filter are properly tuned.
+
+### Key findings
+
+**Complementary filter outperforms Kalman for PID** — the Kalman filter
+introduces a small phase lag that degrades the derivative term, increasing
+overshoot. The complementary filter's higher gyro weighting (α=0.98) produces
+more responsive estimates better suited for PID control.
+
+**LQR requires careful Kalman tuning** — optimal gains computed for a perfect
+system become destabilizing with a poorly tuned estimator. The Kalman filter
+must trust measurements sufficiently (low R_kf) to track fast angle changes,
+otherwise the controller overshoots violently.
+
+**Optimal estimation and optimal control are separate problems** — the best
+filter for one controller is not necessarily best for another. PID performs
+better with the complementary filter; LQR performs better with a well-tuned
+Kalman filter.
 
 ### Run the simulation
 
