@@ -1,236 +1,293 @@
 /*
- * Self-Balancing Robot — Stage 3: PID Control on Hardware
- * ========================================================
- * Implements a closed-loop PID controller on the Adafruit Metro M0 Express.
- * 
- * Hardware:
- *   - Adafruit Metro M0 Express (SAMD21, 48MHz)
- *   - MPU-6050 IMU (I2C) — angle estimation via complementary filter
- *   - TB6612FNG dual motor driver
- *   - 2x TT DC gear motors (6V, 200RPM)
- *   - 4x AA batteries (6V)
- * 
- * Control loop (100Hz):
- *   1. Read IMU → compute angle via complementary filter
- *   2. Compute PID output from angle error
- *   3. Drive motors proportional to PID output
- *   4. Cut motors if angle exceeds safety threshold
- * 
- * Live tuning via serial monitor:
- *   Send P20.5 to set KP, I0.3 for KI, D1.8 for KD, S2.0 for setpoint
- * 
- * Author : Ilias
- * Date   : May 2026
+ * Self-Balancing Robot - PID Controller (rev 4, L298N wiring corrected)
+ * ---------------------------------------------------------------------
+ * Target board : Adafruit Metro M0 (SAMD21)
+ * IMU          : MPU-6050 over I2C
+ * Motor driver : L298N (standard 6-pin control: ENA, IN1, IN2, IN3, IN4, ENB)
+ *
+ * L298N wiring (6 control wires, NOT 8):
+ *   Metro pin 5  (PWM) -> ENA   (Motor A speed)
+ *   Metro pin 3        -> IN1   (Motor A direction)
+ *   Metro pin 4        -> IN2   (Motor A direction)
+ *   Metro pin 8        -> IN3   (Motor B direction)
+ *   Metro pin 9        -> IN4   (Motor B direction)
+ *   Metro pin 10 (PWM) -> ENB   (Motor B speed)
+ *
+ * On the L298N: speed is the PWM duty on ENA/ENB; direction is set by the
+ * complementary IN pairs (IN1/IN2 for A, IN3/IN4 for B).
+ *
+ * IMU mounting (confirmed from diagnostics):
+ *   Z = up, X = forward-tilt axis, rotation about Y -> use gy.
+ *   Angle: 0 deg vertical, negative when tilting forward, positive backward.
  */
 
 #include <Arduino.h>
-#include <Adafruit_MPU6050.h>
-#include <Adafruit_Sensor.h>
 #include <Wire.h>
-#include <math.h>
 
-//Pin definitions
-#define PWMA 5 //Motor A speed control
-#define AIN1 3 //Motor A direction control
-#define AIN2 4 //Motor A direction control
-#define PWMB 10 //Motor B speed control
-#define BIN1 8 //Motor B direction control
-#define BIN2 9 //Motor B direction control
-#define STBY 6 //TB6612FNG standby pin
+// ============================================================
+//  L298N PIN MAP  (6 pins)
+// ============================================================
+#define ENA   5    // Motor A speed  (PWM-capable pin)
+#define IN1   3    // Motor A dir
+#define IN2   4    // Motor A dir
+#define IN3   8    // Motor B dir
+#define IN4   9    // Motor B dir
+#define ENB   10   // Motor B speed  (PWM-capable pin)
 
-//PID control parameters
-float Kp = 20.0; //Proportional gain
-float Ki = 0.5; //Integral gain
-float Kd = 1.5; //Derivative gain
+// ============================================================
+//  USER CONFIGURATION
+// ============================================================
+float Kp = 5.0f;     // start gentle; raise gradually
+float Ki = 0.0f;
+float Kd = 0.5f;
 
-//Setpoint for balancing (target angle)
-float setpoint = 0.0; //Target angle (upright position)
+float setpoint = 0.0f;   // vertical reads ~0 deg
 
-//Complementary filter parameters
-const float alpha = 0.98; //Filter coefficient
-float angle = 0.0; //Estimated angle
-float gyro_biais = 0.0; //Gyro bias
+const float DT          = 0.01f;     // 100 Hz
+const unsigned long DT_US = 10000UL;
+const float ALPHA = 0.98f;
+const float TIP_OVER_ANGLE = 35.0f;
+const float PID_OUT_MAX = 255.0f;
+const float PID_OUT_MIN = -255.0f;
+const int MOTOR_DEADBAND = 30;
 
-//PID state variables
-float integral = 0.0; //Integral term
-float previous_error = 0.0; //Previous error for derivative term
+// Per-motor speed trim: if one motor is faster, scale it down.
+// Tune these so both wheels spin at the same rate at the same command.
+const float MOTOR_A_TRIM = 1.00f;
+const float MOTOR_B_TRIM = 1.00f;
 
-//Timing
-unsigned long previous_time = 0; //Previous time for PID calculation
-const float DT = 0.01; //Time step (10 ms)
+const uint8_t MPU_ADDR = 0x68;
 
-//Safety limits
-const float FALL_ANGLE = 30.0; //Angle at which the robot is considered to have fallen
+// ============================================================
+//  STATE
+// ============================================================
+float angle = 0.0f;
+float gyroBiasY = 0.0f;
+float integralTerm = 0.0f;
+float lastMeasurement = 0.0f;
+unsigned long lastLoopTime = 0;
+bool safetyTripped = false;
 
-Adafruit_MPU6050 mpu;
-
-/*
-    MOTOR CONTROL FUNCTIONS
-*/
-
-void motors_init() {
-  pinMode(PWMA, OUTPUT);
-  pinMode(AIN1, OUTPUT);
-  pinMode(AIN2, OUTPUT);
-  pinMode(PWMB, OUTPUT);
-  pinMode(BIN1, OUTPUT);
-  pinMode(BIN2, OUTPUT);
-  pinMode(STBY, OUTPUT);
-  digitalWrite(STBY, HIGH); //Take the motor driver out of standby mode
+// ============================================================
+//  MPU-6050 HELPERS
+// ============================================================
+void mpuWrite(uint8_t reg, uint8_t value) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(reg);
+  Wire.write(value);
+  Wire.endTransmission();
 }
 
-void motors_stop(){
-    analogWrite(PWMA, 0);
-    analogWrite(PWMB, 0);
-    digitalWrite(AIN1, LOW);
-    digitalWrite(AIN2, LOW);
-    digitalWrite(BIN1, LOW);
-    digitalWrite(BIN2, LOW);
+void mpuInit() {
+  Wire.begin();
+  Wire.setClock(400000);
+  mpuWrite(0x6B, 0x00);
+  mpuWrite(0x1A, 0x03);
+  mpuWrite(0x1B, 0x00);
+  mpuWrite(0x1C, 0x00);
 }
 
-void motors_drive(float output){
-    //Output is a value between -255 and 255
-    //positive output drives forward, negative output drives backward
-    int speed = (int)constrain(abs(output), 0, 255);
-    bool forward = output > 0;
-
-    //Motor A control
-    digitalWrite(AIN1, forward ? HIGH : LOW);
-    digitalWrite(AIN2, forward ? LOW : HIGH);
-    analogWrite(PWMA, speed);
-
-    //Motor B control   
-    digitalWrite(BIN1, forward ? HIGH : LOW);
-    digitalWrite(BIN2, forward ? LOW : HIGH);
-    analogWrite(PWMB, speed);
+void mpuReadAll(int16_t &ax, int16_t &ay, int16_t &az,
+                int16_t &gx, int16_t &gy, int16_t &gz) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x3B);
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU_ADDR, (uint8_t)14);
+  ax = (Wire.read() << 8) | Wire.read();
+  ay = (Wire.read() << 8) | Wire.read();
+  az = (Wire.read() << 8) | Wire.read();
+  Wire.read(); Wire.read();
+  gx = (Wire.read() << 8) | Wire.read();
+  gy = (Wire.read() << 8) | Wire.read();
+  gz = (Wire.read() << 8) | Wire.read();
 }
 
-/*
-    IMU INITIALIZATION AND DATA PROCESSING FUNCTIONS
-*/
+void calibrateGyro(int samples = 1000) {
+  Serial.println(F("Calibrating gyro... keep robot still."));
+  long sum = 0;
+  int16_t ax, ay, az, gx, gy, gz;
+  for (int i = 0; i < samples; i++) {
+    mpuReadAll(ax, ay, az, gx, gy, gz);
+    sum += gy;
+    delay(2);
+  }
+  gyroBiasY = (float)sum / (float)samples / 131.0f;
+  Serial.print(F("Gyro bias Y (deg/s): "));
+  Serial.println(gyroBiasY, 4);
+}
 
-void calibrate_gyro(){
-    Serial.println("Calibrating gyro... Keep the robot still.");
-    float biais = 0.0;
-    for (int i = 0; i < 500; i++) {
-        sensors_event_t a, g, temp;
-        mpu.getEvent(&a, &g, &temp);
-        biais += g.gyro.y; //Assuming the robot is perfectly still, the gyro reading should be zero. Any average offset is considered bias.
-        delay(4);
+void initializeAngle() {
+  int16_t ax, ay, az, gx, gy, gz;
+  mpuReadAll(ax, ay, az, gx, gy, gz);
+  angle = atan2((float)ax, (float)az) * 180.0f / PI;
+  Serial.print(F("Initial angle (deg): "));
+  Serial.println(angle, 2);
+}
+
+float estimateAngle() {
+  int16_t ax, ay, az, gx, gy, gz;
+  mpuReadAll(ax, ay, az, gx, gy, gz);
+  float gyroRate = (float)gy / 131.0f - gyroBiasY;
+  float accelAngle = atan2((float)ax, (float)az) * 180.0f / PI;
+  angle = ALPHA * (angle + gyroRate * DT) + (1.0f - ALPHA) * accelAngle;
+  return angle;
+}
+
+// ============================================================
+//  PID CONTROLLER
+// ============================================================
+float computePID(float measurement) {
+  float error = setpoint - measurement;
+  float pTerm = Kp * error;
+
+  integralTerm += Ki * error * DT;
+  if (integralTerm > PID_OUT_MAX) integralTerm = PID_OUT_MAX;
+  if (integralTerm < PID_OUT_MIN) integralTerm = PID_OUT_MIN;
+
+  float dMeasurement = (measurement - lastMeasurement) / DT;
+  float dTerm = -Kd * dMeasurement;
+  lastMeasurement = measurement;
+
+  float output = pTerm + integralTerm + dTerm;
+  if (output > PID_OUT_MAX) output = PID_OUT_MAX;
+  if (output < PID_OUT_MIN) output = PID_OUT_MIN;
+  return output;
+}
+
+// ============================================================
+//  MOTOR CONTROL  (L298N: ENx = PWM speed, INx = direction)
+// ============================================================
+void setMotorA(int speed, bool forward) {
+  if (speed < 0) speed = 0;
+  if (speed > 255) speed = 255;
+  // Direction via complementary IN pair
+  digitalWrite(IN1, forward ? HIGH : LOW);
+  digitalWrite(IN2, forward ? LOW  : HIGH);
+  // Speed via PWM on enable pin
+  analogWrite(ENA, speed);
+}
+
+void setMotorB(int speed, bool forward) {
+  if (speed < 0) speed = 0;
+  if (speed > 255) speed = 255;
+  digitalWrite(IN3, forward ? HIGH : LOW);
+  digitalWrite(IN4, forward ? LOW  : HIGH);
+  analogWrite(ENB, speed);
+}
+
+void stopMotors() {
+  analogWrite(ENA, 0);
+  analogWrite(ENB, 0);
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+}
+
+// Drive both wheels with signed effort u in [-255, 255].
+// If wheel B happens to be wired mirror-image to A, change the
+// second call to setMotorB(pwmB, !forward).
+void driveMotors(float u) {
+  bool forward = (u >= 0.0f);
+  int pwm = (int)fabsf(u);
+  if (pwm > 0 && pwm < MOTOR_DEADBAND) pwm = MOTOR_DEADBAND;
+  if (pwm > 255) pwm = 255;
+
+  int pwmA = (int)(pwm * MOTOR_A_TRIM);
+  int pwmB = (int)(pwm * MOTOR_B_TRIM);
+
+  setMotorA(pwmA, forward);
+  setMotorB(pwmB, forward);
+}
+
+// ============================================================
+//  LIVE SERIAL TUNING
+// ============================================================
+void handleSerial() {
+  if (!Serial.available()) return;
+  String line = Serial.readStringUntil('\n');
+  line.trim();
+  if (line.length() == 0) return;
+
+  char cmd = line.charAt(0);
+  float val = line.substring(1).toFloat();
+
+  switch (cmd) {
+    case 'p': case 'P':
+      Kp = val; Serial.print(F("Kp = ")); Serial.println(Kp, 4); break;
+    case 'i': case 'I':
+      Ki = val; integralTerm = 0.0f; Serial.print(F("Ki = ")); Serial.println(Ki, 4); break;
+    case 'd': case 'D':
+      Kd = val; Serial.print(F("Kd = ")); Serial.println(Kd, 4); break;
+    case 's': case 'S':
+      setpoint = val; Serial.print(F("setpoint = ")); Serial.println(setpoint, 4); break;
+    case 'r': case 'R':
+      integralTerm = 0.0f; safetyTripped = false; Serial.println(F("Reset.")); break;
+    case '?':
+      Serial.print(F("Kp=")); Serial.print(Kp, 3);
+      Serial.print(F(" Ki=")); Serial.print(Ki, 3);
+      Serial.print(F(" Kd=")); Serial.print(Kd, 3);
+      Serial.print(F(" sp=")); Serial.print(setpoint, 3);
+      Serial.print(F(" angle=")); Serial.println(angle, 3);
+      break;
+    default:
+      Serial.println(F("Use p/i/d/s<val>, r, or ?")); break;
+  }
+}
+
+// ============================================================
+//  SETUP / LOOP
+// ============================================================
+void setup() {
+  Serial.begin(115200);
+  while (!Serial && millis() < 3000);
+
+  pinMode(ENA, OUTPUT); pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(ENB, OUTPUT); pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+  stopMotors();
+
+  mpuInit();
+  delay(100);
+  calibrateGyro();
+  initializeAngle();
+  lastMeasurement = angle;
+
+  Serial.print(F("Boot angle: ")); Serial.print(angle, 2);
+  Serial.print(F("  Setpoint: ")); Serial.print(setpoint, 2);
+  Serial.print(F("  Initial error: ")); Serial.println(setpoint - angle, 2);
+  Serial.println(F("Ready. Commands: p<val> i<val> d<val> s<val> r ?"));
+
+  lastLoopTime = micros();
+}
+
+void loop() {
+  handleSerial();
+
+  unsigned long now = micros();
+  if (now - lastLoopTime < DT_US) return;
+  lastLoopTime += DT_US;
+
+  float theta = estimateAngle();
+
+  if (fabsf(theta - setpoint) > TIP_OVER_ANGLE) {
+    if (!safetyTripped) {
+      Serial.println(F("SAFETY TRIP: tipped. Send 'r' to reset."));
+      safetyTripped = true;
     }
-    gyro_biais = biais / 500.0;
-    Serial.print("Gyro bias: ");
-    Serial.println(gyro_biais, 5);
-}
+    stopMotors();
+    integralTerm = 0.0f;
+    return;
+  }
+  if (safetyTripped) { stopMotors(); return; }
 
-float read_angle(float dt){
-    sensors_event_t a, g, temp;
-    mpu.getEvent(&a, &g, &temp);
+  float u = computePID(theta);
+  driveMotors(u);
 
-    //Calculate angle from accelerometer (in degrees)
-    float acc_angle = atan2(a.acceleration.x, -a.acceleration.z) * 180.0 / PI;
-
-    //Calculate angle from gyro (in degrees)
-    float gyro_rate = g.gyro.y - gyro_biais; //Remove bias
-    float gyro_angle = angle + gyro_rate * dt *180.0 / PI; //Integrate gyro rate to get angle
-
-    //Complementary filter to combine accelerometer and gyro data
-    angle = alpha * gyro_angle + (1 - alpha) * acc_angle;
-
-    return angle;
-}
-
-/*
-    PID CONTROL FUNCTION
-*/
-
-float compute_pid(float current_angle, float dt){
-    float error = current_angle - setpoint; //Calculate error
-
-    //Integral term calculation with anti-windup
-    integral += error * dt; //Update integral term
-    integral = constraint(integral, -50, 50);
-
-    //derivative term calculation
-    float derivative = (error - previous_error) / dt; //Calculate derivative term
-    previous_error = error; //Update previous error
-
-    return Kp * error + Ki * integral + Kd * derivative; //Calculate PID output
-}
-
-/*
-    SETUP AND MAIN LOOP
-*/
-
-void setup()
-{
-    Serial.begin(115200);
-    while (!Serial) delay(10); //Wait for serial connection
-
-    //Initialize IMU
-    if (!mpu.begin()) {
-        Serial.println("Failed to find MPU6050 chip");
-        while (1) {
-            delay(10);
-        }
-    }
-
-    mpu.setAccelerometerRange(MPU6050_RANGE_2_G);
-    mpu.setGyroRange(MPU6050_RANGE_250_DEG);
-    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
-
-    //Initialize motors
-    motors_init();
-    motors_stop();
-
-    //Calibrate gyro
-    calibrate_gyro();
-
-    Serial.println("Setup complete. Starting main loop.");
-    delay(2000);
-
-    last_time = micros();
-}
-
-void loop(){
-    //Enforce a consistent loop timing
-    unsigned long now = micros();
-    if ((now - previous_time) < (DT * 1e6)) return; //Wait until the next time step
-    float dt = (now - previous_time) / 1e6; //Calculate actual time step in seconds
-    previous_time = now; //Update previous time
-
-    //read current angle from IMU
-    angle = read_angle(dt);
-
-    //safety check: if the robot has fallen, stop the motors and reset PID state
-    if (abs(angle) > FALL_ANGLE) {
-        Serial.println("Robot has fallen! Stopping motors.");
-        motors_stop();
-        integral = 0.0; //Reset integral term
-        previous_error = 0.0; //Reset previous error
-        return; //Skip the rest of the loop
-    }
-
-    //Compute PID output
-    float output = compute_pid(angle, dt);
-
-    check_serial_commands();
-    //Drive motors based on PID output
-    motors_drive(output);
-
-    Serial.print("Angle: "); Serial.print(angle, 2);
-    Serial.print(" | PID: "); Serial.println(output, 2);
-    Serial.print(" | Err: "); Serial.print(angle - setpoint, 2);
-}
-
-void check_serial_commands(){
-    if (Serial.available() > 0) {
-       char cmd = Serial.read();
-        float val = Serial.parseFloat();
-        switch (cmd) {
-            case 'P': KP = val; Serial.print("KP="); Serial.println(KP); break;
-            case 'I': KI = val; Serial.print("KI="); Serial.println(KI); break;
-            case 'D': KD = val; Serial.print("KD="); Serial.println(KD); break;
-            case 'S': SETPOINT = val; Serial.print("SP="); Serial.println(SETPOINT); break;
-    }
+  static uint8_t telemetryCounter = 0;
+  if (++telemetryCounter >= 10) {
+    telemetryCounter = 0;
+    Serial.print(theta, 2);
+    Serial.print('\t');
+    Serial.println(u, 1);
+  }
 }
