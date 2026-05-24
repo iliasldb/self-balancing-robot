@@ -37,9 +37,11 @@
 // ============================================================
 //  USER CONFIGURATION
 // ============================================================
-float Kp = 5.0f;     // start gentle; raise gradually
-float Ki = 0.0f;
-float Kd = 0.5f;
+float Kp = 8.0f;     // start gentle; raise gradually
+float Ki = 0.5f;      // beware overshoot if you enable this!
+float Kd = 5.0f;
+
+float filteredD = 0.0f; 
 
 float setpoint = 0.0f;   // vertical reads ~0 deg
 
@@ -49,12 +51,8 @@ const float ALPHA = 0.98f;
 const float TIP_OVER_ANGLE = 35.0f;
 const float PID_OUT_MAX = 255.0f;
 const float PID_OUT_MIN = -255.0f;
-const int MOTOR_DEADBAND = 30;
+//const int MOTOR_DEADBAND = 10;
 
-// Per-motor speed trim: if one motor is faster, scale it down.
-// Tune these so both wheels spin at the same rate at the same command.
-const float MOTOR_A_TRIM = 1.00f;
-const float MOTOR_B_TRIM = 1.00f;
 
 const uint8_t MPU_ADDR = 0x68;
 
@@ -145,8 +143,16 @@ float computePID(float measurement) {
   if (integralTerm < PID_OUT_MIN) integralTerm = PID_OUT_MIN;
 
   float dMeasurement = (measurement - lastMeasurement) / DT;
-  float dTerm = -Kd * dMeasurement;
+  const float D_FILTER = 0.6f;
+  filteredD = D_FILTER * filteredD + (1.0f - D_FILTER) * dMeasurement;
+
+  float dTerm = Kd * filteredD;
   lastMeasurement = measurement;
+
+  const float I_MAX = 40.0f;
+
+  if (integralTerm > I_MAX) integralTerm = I_MAX;
+  if (integralTerm < -I_MAX) integralTerm = -I_MAX;
 
   float output = pTerm + integralTerm + dTerm;
   if (output > PID_OUT_MAX) output = PID_OUT_MAX;
@@ -187,14 +193,33 @@ void stopMotors() {
 // Drive both wheels with signed effort u in [-255, 255].
 // If wheel B happens to be wired mirror-image to A, change the
 // second call to setMotorB(pwmB, !forward).
-void driveMotors(float u) {
-  bool forward = (u >= 0.0f);
-  int pwm = (int)fabsf(u);
-  if (pwm > 0 && pwm < MOTOR_DEADBAND) pwm = MOTOR_DEADBAND;
-  if (pwm > 255) pwm = 255;
+// Motor B starts slightly earlier than A, so trim A up slightly
+const float MOTOR_A_TRIM = 1.08f;   // nudge A to match B
+const float MOTOR_B_TRIM = 1.00f;
 
-  int pwmA = (int)(pwm * MOTOR_A_TRIM);
-  int pwmB = (int)(pwm * MOTOR_B_TRIM);
+const float MOTOR_THRESHOLD = 100.0f;  // measured true deadband
+
+void driveMotors(float u) {
+  if (fabsf(u) < 1.0f) {
+    stopMotors();
+    return;
+  }
+
+  bool forward = (u > 0.0f);
+  float absU = fabsf(u);
+
+  // Boost negative direction slightly to compensate L298N asymmetry
+  // Tune NEGATIVE_TRIM between 1.0 and 1.2 until both directions feel equal
+  const float NEGATIVE_TRIM = 1.0f;
+  if (!forward) absU = constrain(absU * NEGATIVE_TRIM, 0.0f, 255.0f);
+
+  float normalized = absU / 255.0f;
+  float curved = normalized * normalized;
+  float pwm = 100.0f + curved * 155.0f;
+  if (pwm > 255.0f) pwm = 255.0f;
+
+  int pwmA = constrain((int)(pwm * MOTOR_A_TRIM), 0, 255);
+  int pwmB = constrain((int)(pwm * MOTOR_B_TRIM), 0, 255);
 
   setMotorA(pwmA, forward);
   setMotorB(pwmB, forward);
